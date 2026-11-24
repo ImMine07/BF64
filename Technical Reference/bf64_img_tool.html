@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BF64 IMG 슬롯 / HEX 입력기</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--bd:#ccc;--ac:#2557d6;--pn:#f4f5f7}
+@media(prefers-color-scheme:dark){:root{--bg:#16181d;--fg:#e8e8e8;--mut:#9aa3ad;--bd:#3a3f4a;--ac:#6c9bff;--pn:#20242c}}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif;max-width:820px;margin:0 auto;padding:16px}
+h1{font-size:18px;margin:0 0 12px}h2{font-size:15px;margin:0 0 8px}
+section{background:var(--pn);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:12px}
+input,select,textarea,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
+button{cursor:pointer;background:var(--ac);color:#fff;border-color:var(--ac)}button.s{background:var(--bg);color:var(--fg);border-color:var(--bd)}
+textarea{width:100%;box-sizing:border-box;font-family:ui-monospace,Consolas,monospace;min-height:130px}
+.r{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd);padding:4px 6px;text-align:left}
+pre{overflow-x:auto;max-height:260px;margin:8px 0 0;font-size:12px}#msg{font-weight:600;min-height:1.4em}.m{color:var(--mut);font-size:12px}
+</style></head><body>
+<h1>BF64 IMG 슬롯 도구 · HEX 입력기</h1>
+<p class="m">BF64FS v2 플로피 이미지(.img)를 OS 바깥에서 만들고, BF 스크립트를 슬롯에 넣습니다. OS에서는 <b>LOAD "A:이름"</b> → <b>RUN</b>.</p>
+<div id="msg"></div>
+
+<section><h2>1. 이미지</h2>
+<div class="r"><select id="size"><option value="720">360KB</option><option value="1440">720KB</option><option value="2400">1.2MB</option><option value="2880" selected>1.44MB</option><option value="5760">2.88MB</option></select>
+<button id="mk">새 빈 이미지(포맷)</button><span class="m">또는</span><input type="file" id="file" accept=".img,.ima,.bin"><button id="dl" class="s">IMG 저장</button></div>
+<div id="info" class="m"></div></section>
+
+<section><h2>2. 슬롯 목록</h2>
+<table><thead><tr><th>슬롯</th><th>이름</th><th>크기(B)</th><th></th></tr></thead><tbody id="tb"></tbody></table></section>
+
+<section><h2>3. BF 스크립트 입력</h2>
+<div class="r"><input id="name" placeholder="파일명 (최대 12자)" maxlength="12" size="14">
+<input id="slot" type="number" min="1" placeholder="슬롯(자동)" style="width:100px">
+<select id="mode"><option value="txt">BF 텍스트</option><option value="hex">HEX (BF 소스의 ASCII 바이트)</option><option value="raw">HEX (슬롯 원본 레코드)</option></select>
+<label><input type="checkbox" id="only" checked> BF 명령 문자만 저장</label></div>
+<textarea id="src" spellcheck="false" placeholder="예) ++++++++[>++++++++<-]>+.   (HEX 모드: 2B 2B 5B 3E 2B 3C 2D 5D …)"></textarea>
+<div class="r" style="margin-top:8px"><button id="wr">슬롯에 쓰기</button>
+<span class="m">줄마다 10, 20, 30… 번호가 자동 부여됩니다. 한 줄이 240자를 넘으면 분할됩니다.</span></div>
+<pre id="out"></pre></section>
+
+<script>
+const SS=512,SB=16384,LIM=16127,$=id=>document.getElementById(id);
+let img=null,sb=null,fname='bf64data.img';
+const log=(m,e)=>{$('msg').textContent=m;$('msg').style.color=e?'#d33':'inherit'};
+const ent=n=>(1+((n-1)>>5))*SS+((n-1)&31)*16;
+const soff=n=>(sb.data+(n-1)*32)*SS;
+const dirE=n=>{const o=ent(n);let nm='';for(let i=1;i<14&&img[o+i];i++)nm+=String.fromCharCode(img[o+i]);return{used:img[o]===1,name:nm,size:img[o+14]|img[o+15]<<8}};
+
+function layout(total){ // OS의 FORMAT 계산식과 동일
+  const avail=total-1,dirs=n=>Math.ceil(n/32);let s=Math.floor(avail/32);
+  while(s>0&&s*32+dirs(s)>avail)s--;
+  if(s<1)throw Error('용량이 너무 작습니다');
+  return{slots:s,dirs:dirs(s),data:1+dirs(s)};
+}
+function parseSB(b){
+  if(b.length<1024||String.fromCharCode(b[0],b[1],b[2],b[3])!=='BF64'||b[4]!==2)throw Error('BF64FS v2 이미지가 아닙니다. 새 이미지를 만들거나 OS에서 FORMAT A: 하세요.');
+  const dv=new DataView(b.buffer,b.byteOffset),data=dv.getUint32(12,true),slots=dv.getUint32(16,true);
+  if(!slots||(data+slots*32)*SS>b.length)throw Error('슈퍼블록 값이 이미지 크기와 맞지 않습니다.');
+  return{slots,data,dirs:dv.getUint16(20,true)};
+}
+function walk(d){ // 레코드 [len][줄번호 2B][텍스트][0] ... [0] 검증
+  let p=0;const r=[];
+  for(;;){const l=d[p]||0;if(!l)break;
+    if(l<4||p+l>d.length||d[p+l-1])throw Error('레코드 형식 오류 (오프셋 '+p+')');
+    r.push([d[p+1]|d[p+2]<<8,Array.from(d.subarray(p+3,p+l-1),c=>String.fromCharCode(c)).join('')]);p+=l;}
+  return{r,size:p+1};
+}
+function build(text){
+  const keep=$('only').checked,rec=[];let ln=10;
+  for(const raw of text.split(/\r?\n/)){
+    const t=raw.replace(keep?/[^><+\-.,\[\]]/g:/[^\x20-\x7e]/g,'').trim();
+    for(let i=0;i<t.length;i+=240){
+      const c=t.slice(i,i+240);if(ln>65535)throw Error('줄 번호 초과');
+      rec.push(c.length+4,ln&255,ln>>8);
+      for(let k=0;k<c.length;k++)rec.push(c.charCodeAt(k));
+      rec.push(0);ln+=10;}
+  }
+  rec.push(0);return Uint8Array.from(rec);
+}
+function hexBytes(s){
+  s=s.replace(/0x/gi,'').replace(/[\s,;:]/g,'');
+  if(!s||s.length%2||/[^0-9a-f]/i.test(s))throw Error('HEX 형식 오류: 0-9, A-F 로 이루어진 짝수 길이여야 합니다.');
+  const o=new Uint8Array(s.length/2);for(let i=0;i<o.length;i++)o[i]=parseInt(s.substr(i*2,2),16);return o;
+}
+
+function render(){
+  const tb=$('tb');tb.textContent='';let used=0;
+  for(let n=1;n<=sb.slots;n++){const e=dirE(n);if(!e.used)continue;used++;
+    const tr=tb.insertRow();tr.insertCell().textContent=n;tr.insertCell().textContent=e.name;tr.insertCell().textContent=e.size;
+    const c=tr.insertCell(),v=document.createElement('button'),d=document.createElement('button');
+    v.textContent='보기';v.className='s';v.onclick=()=>view(n);d.textContent='삭제';d.className='s';d.onclick=()=>del(n);c.append(v,' ',d);}
+  $('info').textContent=fname+' · '+(img.length/1024)+'KB · 슬롯 '+used+'/'+sb.slots+' 사용 (슬롯당 16KB, 데이터 시작 LBA '+sb.data+')';
+}
+function view(n){
+  try{const d=img.subarray(soff(n),soff(n)+SB),w=walk(d);
+    const hx=Array.from(d.subarray(0,Math.min(w.size,512)),b=>b.toString(16).padStart(2,'0')).join(' ');
+    $('out').textContent=w.r.map(x=>x[0]+' '+x[1]).join('\n')+'\n\n[HEX '+Math.min(w.size,512)+'/'+w.size+'B]\n'+hx;
+  }catch(x){log(x.message,1)}
+}
+function del(n){const e=ent(n);img.fill(0,e,e+16);render();log('슬롯 '+n+' 삭제됨');}
+
+$('mk').onclick=()=>{try{const t=+$('size').value,L=layout(t);
+  img=new Uint8Array(t*SS);img.set([66,70,54,52,2]);const dv=new DataView(img.buffer);
+  dv.setUint32(12,L.data,true);dv.setUint32(16,L.slots,true);dv.setUint16(20,L.dirs,true);dv.setUint16(22,32,true);
+  sb=L;fname='bf64data.img';render();log('새 이미지 생성: 슬롯 '+L.slots+'개');}catch(x){log(x.message,1)}};
+$('file').onchange=async e=>{const f=e.target.files[0];if(!f)return;
+  try{const b=new Uint8Array(await f.arrayBuffer());sb=parseSB(b);img=b;fname=f.name;render();log('이미지를 열었습니다');}catch(x){log(x.message,1)}};
+$('dl').onclick=()=>{if(!img)return log('저장할 이미지가 없습니다',1);
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([img]));a.download=fname;a.click();};
+
+$('wr').onclick=()=>{try{
+  if(!img)throw Error('먼저 이미지를 만들거나 여세요.');
+  const nm=$('name').value.trim().toUpperCase();
+  if(!/^[A-Z0-9._-]{1,12}$/.test(nm))throw Error('이름은 1~12자의 영문/숫자/._- 만 가능합니다.');
+  const m=$('mode').value,t=$('src').value;let d;
+  if(m==='txt')d=build(t);
+  else if(m==='hex')d=build(Array.from(hexBytes(t),c=>String.fromCharCode(c)).join(''));
+  else d=hexBytes(t);
+  const sz=walk(d).size;
+  if(sz>LIM)throw Error('용량 초과: '+sz+' / '+LIM+' 바이트');
+  let n=+$('slot').value||0,same=0,free=0;
+  for(let i=1;i<=sb.slots;i++){const e=dirE(i);if(e.used&&e.name===nm)same=i;if(!e.used&&!free)free=i;}
+  if(n&&(n>sb.slots))throw Error('슬롯 번호는 1~'+sb.slots);
+  if(n&&same&&same!==n)throw Error('같은 이름이 슬롯 '+same+'에 이미 있습니다.');
+  if(!n)n=same||free;if(!n)throw Error('빈 슬롯이 없습니다.');
+  const o=soff(n);img.fill(0,o,o+SB);img.set(d.subarray(0,sz),o);
+  const e=ent(n);img.fill(0,e,e+16);img[e]=1;
+  for(let i=0;i<nm.length;i++)img[e+1+i]=nm.charCodeAt(i);
+  img[e+14]=sz&255;img[e+15]=sz>>8;
+  render();view(n);log('슬롯 '+n+' 에 "'+nm+'" 저장 ('+sz+'B). IMG 저장 후 OS에서 LOAD "A:'+nm+'"');
+}catch(x){log(x.message,1)}};
+</script></body></html>
